@@ -68,8 +68,16 @@ class BlockSparseLinear(nn.Module):
         self.out_block_idx, self.in_block_idx = mask.nonzero(as_tuple=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Handle arbitrary batch dimensions by flattening to 2D
+        orig_shape = x.shape
+        x = x.view(-1, self.in_features)
+
         batch_size = x.shape[0]
         out = torch.zeros(batch_size, self.out_features, device=x.device, dtype=x.dtype)
+
+        # Handle empty batch case
+        if batch_size == 0:
+            return (out + self.bias).view(*orig_shape[:-1], self.out_features)
 
         for i, (out_b, in_b) in enumerate(zip(self.out_block_idx, self.in_block_idx)):
             in_start = in_b * self.block_size
@@ -81,7 +89,8 @@ class BlockSparseLinear(nn.Module):
             w_block = self.weight[i, :in_end-in_start, :out_end-out_start]
             out[:, out_start:out_end] += x_block @ w_block
 
-        return out + self.bias
+        # Restore original shape
+        return (out + self.bias).view(*orig_shape[:-1], self.out_features)
 
 class DynamicRouter(nn.Module):
     def __init__(self, input_dim: int, n_experts: int, k: int = 2):
@@ -96,8 +105,8 @@ class DynamicRouter(nn.Module):
         top_k_logits, top_k_indices = torch.topk(logits, self.k, dim=-1)
         routing_weights = torch.softmax(top_k_logits, dim=-1)
 
-        batch_size = x.shape[0]
-        routing_matrix = torch.zeros(batch_size, self.n_experts, device=x.device)
+        batch_size, seq_len = x.shape[0], x.shape[1]
+        routing_matrix = torch.zeros(batch_size, seq_len, self.n_experts, device=x.device)
         routing_matrix.scatter_(-1, top_k_indices, routing_weights)
 
         return routing_matrix, top_k_indices
@@ -132,10 +141,11 @@ class HierarchicalSparseLayer(nn.Module):
             expert_outputs = torch.zeros_like(x)
 
             for i, expert in enumerate(self.experts):
-                mask = routing_matrix[:, i] > 0
+                # routing_matrix shape: (batch, seq_len, n_experts)
+                mask = routing_matrix[:, :, i] > 0
                 if mask.any():
                     expert_input = x[mask]
-                    weighted_output = expert(expert_input) * routing_matrix[mask, i].unsqueeze(-1)
+                    weighted_output = expert(expert_input) * routing_matrix[:, :, i][mask].unsqueeze(-1)
                     expert_outputs[mask] += weighted_output
 
         return residual + self.cross_layer(expert_outputs)
@@ -154,15 +164,25 @@ class AdaptiveMemoryBank(nn.Module):
         self.key_proj = BlockSparseLinear(dim, dim, sparsity=0.9)
 
     def forward(self, query: torch.Tensor) -> torch.Tensor:
-        q = self.query_proj(query)
-        k = self.key_proj(self.memory)
+        # query shape: (batch, seq_len, dim) or (batch, dim)
+        orig_shape = query.shape
+        q = self.query_proj(query)  # Same shape as query
 
-        scores = torch.cdist(q, k, p=2)
-        top_k_scores, top_k_indices = torch.topk(scores, self.k, dim=-1, largest=False)
+        # Flatten batch dimensions for distance computation
+        q_flat = q.view(-1, self.dim)  # (batch*seq_len, dim)
 
-        retrieved = self.memory[top_k_indices]
-        weights = torch.softmax(-top_k_scores, dim=-1).unsqueeze(-1)
-        return (retrieved * weights).sum(dim=1)
+        # Compute distances to all memory entries
+        # q_flat: (N, dim), memory: (memory_size, dim)
+        scores = torch.cdist(q_flat.unsqueeze(0), self.memory.unsqueeze(0), p=2).squeeze(0)  # (N, memory_size)
+
+        top_k_scores, top_k_indices = torch.topk(scores, self.k, dim=-1, largest=False)  # (N, k)
+
+        retrieved = self.memory[top_k_indices]  # (N, k, dim)
+        weights = torch.softmax(-top_k_scores, dim=-1).unsqueeze(-1)  # (N, k, 1)
+        output = (retrieved * weights).sum(dim=1)  # (N, dim)
+
+        # Reshape back to original batch dimensions
+        return output.view(*orig_shape[:-1], self.dim)
 
 class SHAMN(nn.Module):
     def __init__(self, config: CPUConfig):
